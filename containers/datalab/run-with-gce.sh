@@ -32,7 +32,8 @@ to look it up using the 'ifconfig' command.
 "
 
 ERR_USAGE=1
-ERR_DEPLOY=2
+ERR_LOGIN=2
+ERR_DEPLOY=3
 
 DOCS="This script runs Datalab connected to a kernel gateway running in a GCE VM.
 
@@ -60,14 +61,39 @@ fi
 
 echo "${DOCS}"
 
-INSTANCE=`gcloud compute instances list --regex "datalab-kernel-gateway-[0-9]*" --limit 1 --format "value(name)"`
+# We want to run the kernel gateway in a VM. However, we also want to make sure
+# there is a 1:1 correspondence between end user and kernel gateway, so we need
+# to create a separate VM for each user.
+#
+# To do this, we will name the VM with a prefix tied to the user. Since
+# usernames can include arbitrary characters, we sanitize the username by first
+# hashing it. We use the openssl implementation of sha1 for this purpose,
+# solely for the fact that it should be nearly ubiquitous.
+#
+# NOTE: THIS IS NOT A SECURITY SANDBOX. When running in a GCE VM, Datalab is in
+# an inherently shared environment. This separation is merely to prevent
+# accidental conflicts between users, not to provide any sort of privacy or
+# authentication.
+USER_EMAIL=`gcloud info --format="value(config.account)"`
+if [[ -z "${USER_EMAIL}" ]]; then
+  echo "You must log in via the gcloud tool"
+  echo "    gcloud auth login"
+  exit ${ERR_LOGIN}
+fi
+
+echo "Looking up gateway VM for ${USER_EMAIL}..."
+
+USER_HASH=`echo "${USER_EMAIL}" | openssl sha1 -r | cut -d ' ' -f 1`
+INSTANCE_PREFIX="datalab-gateway-${USER_HASH:0:12}"
+
+INSTANCE=`gcloud compute instances list --project "${PROJECT}" --zone "${ZONE}" --regex "${INSTANCE_PREFIX}-[0-9]*" --limit 1 --format "value(name)"`
 if [[ -z "${INSTANCE}" ]]; then
-  echo "Could not find an existing GCE VM. Will create one..."
+  echo "Could not find an existing gateway VM for '${USER_EMAIL}'. Will create one..."
+  INSTANCE="${INSTANCE_PREFIX}-${RANDOM}"
   pushd ./
   cd ../gateway
-  ./deploy.sh "${PROJECT}" "${ZONE}" || exit ${ERR_DEPLOY}
+  ./deploy.sh "${PROJECT}" "${ZONE}" "${INSTANCE}" || exit ${ERR_DEPLOY}
   popd
-  INSTANCE=`gcloud compute instances list --regex "datalab-kernel-gateway-[0-9]*" --limit 1 --format "value(name)"`
 fi
 
 echo "Will connect to the kernel gateway running on ${INSTANCE}"
@@ -79,6 +105,16 @@ echo "Will connect to the kernel gateway running on ${INSTANCE}"
 #
 # To get around this, we only use gcloud to print the SSH command
 # (via the --dry-run flag), and then run that SSH command directly.
+#
+# Unfortunately, the --dry-run flag also prevents the SSH keys from
+# being cascaded to the VM, so we also have to run a no-op SSH
+# command first to perform the SSH key setup. However, that has the
+# added benefit of ensuring that the VM is SSH-able before we try
+# to connect to it
+gcloud compute ssh --project "${PROJECT}" \
+  --zone "${ZONE}" \
+  "${INSTANCE}" \
+  "true"
 SSH_CMD=`gcloud compute ssh --dry-run --project "${PROJECT}" --zone "${ZONE}" --ssh-flag="-NL" --ssh-flag="${DOCKER_IP}:8082:localhost:8080" "${INSTANCE}"`
 ${SSH_CMD} &
 SSH_PID="$!"
